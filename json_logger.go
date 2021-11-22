@@ -18,7 +18,7 @@ import (
 //	mylog.WithField("nihao", "hah").Info("信息")
 //	mylog.WithField("name", "zhangsan").WithField("age", 18).Info("个人信息")
 //	mylog.WithField("name", "zhangsan").WithField("age", 18).Infof("个人信息: %s", introduction)
-//	mylog.JsonOut.Infof("ads: %s", introduction)
+//	mylog.JsonOut().Infof("ads: %s", introduction)
 // output:
 //	{"level":"info","time":"2021/11/11 13:54:47.060","msg":"信息","file_no":"main.go:7","nihao":"hah"}
 //	{"level":"info","time":"2021/11/11 13:54:47.060","msg":"个人信息","file_no":"main.go:8","name":"zhangsan","age":18}
