@@ -11,14 +11,13 @@ import (
 	"time"
 	"unsafe"
 )
-
 // jsonLogger 完全基于标准库实现json日志格式的输出, 高效、简洁.兼容logrus等日志框架.
 // For example:
 //	introduction := "introduction"
 //	mylog.WithField("nihao", "hah").Info("信息")
 //	mylog.WithField("name", "zhangsan").WithField("age", 18).Info("个人信息")
 //	mylog.WithField("name", "zhangsan").WithField("age", 18).Infof("个人信息: %s", introduction)
-//	mylog.JsonOut().Infof("ads: %s", introduction)
+//	mylog.JsonOut().Infof("introduction: %s", introduction)
 // output:
 //	{"level":"info","time":"2021/11/11 13:54:47.060","msg":"信息","file_no":"main.go:7","nihao":"hah"}
 //	{"level":"info","time":"2021/11/11 13:54:47.060","msg":"个人信息","file_no":"main.go:8","name":"zhangsan","age":18}

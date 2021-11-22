@@ -77,6 +77,19 @@ func Info(v ...interface{}) {
 func Infof(format string, v ...interface{}) {
 	_ = infoLogger.Output(2, fmt.Sprintf(format, v...))
 }
+
+// Println
+// Deprecated: please use Info.
+func Println(v ...interface{}) {
+	_ = infoLogger.Output(2, fmt.Sprintln(v...))
+}
+
+// Printf
+// Deprecated: please use Infof.
+func Printf(format string, v ...interface{}) {
+	_ = infoLogger.Output(2, fmt.Sprintf(format, v...))
+}
+
 func Warn(v ...interface{}) {
 	_ = warnLogger.Output(2, fmt.Sprintln(v...))
 }
