@@ -1,133 +1,229 @@
 package mylog
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+	"time"
 )
 
-const logFlag = log.Lmicroseconds | log.Ldate | log.Lshortfile
-
-//  infoPrefix warnPrefix errPrefix panicPrefix fatalPrefix 日志输出前缀.
 const (
-	infoPrefix  = "[INFO] "
-	warnPrefix  = "[WARN] "
-	errPrefix   = "[ERROR] "
-	panicPrefix = "[PANIC] "
-	fatalPrefix = "[FATAL] "
+	levelInfo = level("INFO")
+	levelWarn = level("WARN")
+	levelErr  = level("ERROR")
 )
 
-/*
- 开头部分：\033[显示方式;前景色;背景色m + 结尾部分：\033[0m
-分类和数值表示的参数含义：
-显示方式: 0（默认值）、1（高亮）、22（非粗体）、4（下划线）、24（非下划线）、 5（闪烁）、25（非闪烁）、7（反显）、27（非反显）
-前景色: 30（黑色）、31（红色）、32（绿色）、 33（黄色）、34（蓝色）、35（洋 红）、36（青色）、37（白色）
-背景色: 40（黑色）、41（红色）、42（绿色）、 43（黄色）、44（蓝色）、45（洋 红）、46（青色）、47（白色）
-*/
-var (
-	infoLogger  = log.New(os.Stdout, infoPrefix, logFlag)
-	warnLogger  = log.New(os.Stdout, warnPrefix, logFlag)
-	errLogger   = log.New(os.Stdout, errPrefix, logFlag)
-	panicLogger = log.New(os.Stdout, panicPrefix, logFlag)
-	fatalLogger = log.New(os.Stdout, fatalPrefix, logFlag)
-	once        = new(sync.Once)
-)
+var jsonBPool = sync.Pool{New: func() interface{} { return make([]byte, 4<<10) }} // 默认4kb
 
-type Config struct {
-	InfoWriter  io.Writer
-	WarnWriter  io.Writer
-	ErrWriter   io.Writer
-	PanicWriter io.Writer
-	FatalWriter io.Writer
+type logger struct {
+	mu         sync.Mutex // ensures atomic writes; protects the following fields
+	infoWriter io.Writer
+	warnWriter io.Writer
+	errWriter  io.Writer
+	ctxKeys    []string // 存放与ctx中的链路追踪信息
+}
+type entry struct {
+	level    level
+	time     string
+	file     string
+	line     int
+	function string
+	msg      string
+	fields   [][2]interface{}
 }
 
-// Init set the Writer. It does nothing when after doing first.
-func Init(c *Config) {
-	once.Do(func() {
-		if c.InfoWriter != nil {
-			infoLogger.SetOutput(c.InfoWriter)
-			infoLogger.SetPrefix(infoPrefix)
-		}
-		if c.WarnWriter != nil {
-			warnLogger.SetOutput(c.WarnWriter)
-			warnLogger.SetPrefix(warnPrefix)
-		}
-		if c.ErrWriter != nil {
-			errLogger.SetOutput(c.ErrWriter)
-			errLogger.SetPrefix(errPrefix)
-		}
-		if c.PanicWriter != nil {
-			panicLogger.SetOutput(c.PanicWriter)
-			panicLogger.SetPrefix(panicPrefix)
-		}
-		if c.FatalWriter != nil {
-			fatalLogger.SetOutput(c.FatalWriter)
-			fatalLogger.SetPrefix(fatalPrefix)
-		}
-		jsonLogger.setConfig(c)
-	})
+var loggerGlobal = logger{mu: sync.Mutex{},
+	infoWriter: os.Stdout,
+	warnWriter: os.Stdout,
+	errWriter:  os.Stdout,
 }
 
-func Info(v ...interface{}) {
-	_ = infoLogger.Output(2, fmt.Sprintln(v...))
-}
-func Infof(format string, v ...interface{}) {
-	_ = infoLogger.Output(2, fmt.Sprintf(format, v...))
-}
-
-// Println
-// Deprecated: please use Info.
-func Println(v ...interface{}) {
-	_ = infoLogger.Output(2, fmt.Sprintln(v...))
-}
-
-// Printf
-// Deprecated: please use Infof.
-func Printf(format string, v ...interface{}) {
-	_ = infoLogger.Output(2, fmt.Sprintf(format, v...))
-}
-
-func Warn(v ...interface{}) {
-	_ = warnLogger.Output(2, fmt.Sprintln(v...))
-}
-func Warnf(format string, v ...interface{}) {
-	_ = warnLogger.Output(2, fmt.Sprintf(format, v...))
-}
-func Error(v ...interface{}) {
-	_ = errLogger.Output(2, fmt.Sprintln(v...))
-}
-func Errorf(format string, v ...interface{}) {
-	_ = errLogger.Output(2, fmt.Sprintf(format, v...))
-}
-func Panic(v ...interface{}) {
-	s := fmt.Sprintln(v...)
-	_ = panicLogger.Output(2, s)
-	panic(s)
-}
-func Panicf(format string, v ...interface{}) {
-	s := fmt.Sprintf(format, v...)
-	_ = panicLogger.Output(2, s)
-	panic(s)
-}
-func Fatal(v ...interface{}) {
-	_ = fatalLogger.Output(2, fmt.Sprintln(v...))
-	os.Exit(1)
-}
-func Fatalf(format string, v ...interface{}) {
-	_ = fatalLogger.Output(2, fmt.Sprintf(format, v...))
-	os.Exit(1)
-}
-
-func init() {
-	if runtime.GOOS != "windows" {
-		// 仅仅当为非windows平台,且为标准输出时才为带颜色输出. json不支持
-		infoLogger.SetPrefix("\033[1;32m[INFO] \033[0m")
-		warnLogger.SetPrefix("\033[1;33m[WARN] \033[0m")
-		errLogger.SetPrefix("\033[1;31m[ERROR] \033[0m")
-		panicLogger.SetPrefix("\033[1;37;31m[PANIC] \033[0m")
-		fatalLogger.SetPrefix("\033[5;32m[FATAL] \033[0m")
+// Ctx .
+func Ctx(ctx context.Context) *entry {
+	pc := make([]uintptr, 2)
+	_ = runtime.Callers(2, pc)
+	frame := runtime.CallersFrames(pc)
+	var file, function string
+	var line int
+	if f, ok := frame.Next(); ok {
+		function = f.Function[strings.LastIndex(f.Function, "/")+1:]
+		file = filepath.Base(f.File)
+		line = f.Line
 	}
+	fields := make([][2]interface{}, 0, len(loggerGlobal.ctxKeys)+2)
+
+	for _, k := range loggerGlobal.ctxKeys {
+		if v := ctx.Value(k); v != nil {
+			fields = append(fields, [2]interface{}{k, v})
+		}
+	}
+	return &entry{
+		time:     time.Now().Format("2006-01-02 15:04:05.000"),
+		file:     file,
+		line:     line,
+		function: function,
+		fields:   fields,
+	}
+}
+
+type level string
+
+// WithField key-value.
+func (e *entry) WithField(k string, v interface{}) *entry {
+	e.fields = append(e.fields, [2]interface{}{k, v})
+	return e
+}
+
+// WithFields key-value.
+func (e *entry) WithFields(k1 string, v1 interface{}, k2 string, v2 interface{}, kvs ...interface{}) *entry {
+	e.fields = append(e.fields, [2]interface{}{k1, v1}, [2]interface{}{k2, v2})
+	if len(kvs) == 0 {
+		return e
+	}
+	if len(kvs)%2 != 0 {
+		for i := 0; i < len(kvs); i += 2 {
+			if i+1 < len(kvs) {
+				e.fields = append(e.fields, [2]interface{}{fmt.Sprint(kvs[i]), kvs[i+1]})
+			} else {
+				e.fields = append(e.fields, [2]interface{}{fmt.Sprint(kvs[i]), "??? key或value缺失"})
+			}
+		}
+		return e
+	}
+	for i := 0; i < len(kvs); i += 2 {
+		e.fields = append(e.fields, [2]interface{}{kvs[i], kvs[i+1]})
+	}
+	return e
+}
+
+func (e *entry) Info(a ...interface{}) {
+	_ = e.outputLn(levelInfo, a...)
+}
+func (e *entry) Warn(a ...interface{}) {
+	_ = e.outputLn(levelWarn, a...)
+}
+func (e *entry) Error(a ...interface{}) {
+	_ = e.outputLn(levelErr, a...)
+}
+
+func (e *entry) Infof(format string, a ...interface{}) {
+	_ = e.outputFln(levelInfo, format, a...)
+}
+func (e *entry) Warnf(format string, a ...interface{}) {
+	_ = e.outputFln(levelWarn, format, a...)
+}
+func (e *entry) Errorf(format string, a ...interface{}) {
+	_ = e.outputFln(levelErr, format, a...)
+}
+
+func (e *entry) outputLn(l level, a ...interface{}) error {
+	return e.output(l, "", a...)
+}
+func (e *entry) outputFln(l level, format string, a ...interface{}) error {
+	return e.output(l, format, a...)
+}
+
+func (e *entry) toJsonB() []byte {
+	result := jsonBPool.Get().([]byte)
+	defer func() { jsonBPool.Put(result) }()
+	if len(e.fields) == 0 {
+		n := copy(result, fmt.Sprintf("[%s] %s %s:%d [%s] %s\n", e.level, e.time, e.file, e.line, e.function, e.msg))
+		return result[:n]
+	}
+	index := copy(result, fmt.Sprintf("[%s] %s %s:%d [%s] %s {", e.level, e.time, e.file, e.line, e.function, e.msg))
+	var elem string
+	var s string
+	var b []byte
+	var err error
+	var key string
+	for i := 0; i < len(e.fields); i++ {
+		key, _ = e.fields[i][0].(string)
+		switch e.fields[i][1].(type) {
+		case string:
+			s = e.fields[i][1].(string)
+			// 生支持json的输出 去除 JsonStr
+			if len(s) > 0 {
+				if (s[0] == '{' && s[len(s)-1] == '}') || (s[0] == '[' && s[len(s)-1] == ']') {
+					elem = `"` + key + `":` + s
+					break
+				}
+			}
+			elem = `"` + key + `":"` + s + `"`
+		case []byte:
+			s = string(e.fields[i][1].([]byte))
+			// 生支持json的输出 去除 JsonStr
+			if len(s) > 0 {
+				if (s[0] == '{' && s[len(s)-1] == '}') || (s[0] == '[' && s[len(s)-1] == ']') {
+					elem = `"` + key + `":` + s
+					break
+				}
+			}
+			elem = `"` + key + `":"` + s + `"`
+		case fmt.Stringer:
+			s = e.fields[i][1].(fmt.Stringer).String()
+			elem = `"` + key + `":"` + s + `"`
+		default:
+			b, err = json.Marshal(e.fields[i][1]) // 效率和fmt.Sprintf差不多
+			if err == nil {
+				elem = `"` + key + `":` + string(b)
+			} else {
+				s = fmt.Sprintf(`%+v`, e.fields[i][1])
+				elem = `"` + key + `":"` + s + `"`
+			}
+		}
+		if i != 0 {
+			elem = "," + elem
+		}
+		if len(result[index:]) < len(elem) {
+			result = append(result, make([]byte, len(elem))...)
+		}
+		index += copy(result[index:], elem)
+	}
+	if len(result[index:]) < 2 {
+		result = append(result, make([]byte, 2)...)
+	}
+	copy(result[index:], []byte{'}', '\n'})
+	return result[:index+2]
+}
+func (e *entry) output(l level, format string, a ...interface{}) error {
+	var msg string
+	if format == "" {
+		msg = fmt.Sprintln(a...)
+		msg = msg[:len(msg)-1] // 去除末尾的\n符号
+	} else {
+		msg = fmt.Sprintf(format, a...)
+	}
+	e.msg = msg
+	e.level = l
+
+	output := e.toJsonB()
+	loggerGlobal.mu.Lock()
+	defer loggerGlobal.mu.Unlock()
+	var outWriter io.Writer
+	switch l {
+	case levelInfo:
+		outWriter = loggerGlobal.infoWriter
+	case levelWarn:
+		outWriter = loggerGlobal.warnWriter
+	case levelErr:
+		outWriter = loggerGlobal.errWriter
+	}
+	_, err := outWriter.Write(output)
+	return err
+}
+
+// Init set the Writer and Context Keys.
+func Init(infoF, warnF, errF io.Writer, CtxKeys ...string) {
+	loggerGlobal.mu.Lock()
+	defer loggerGlobal.mu.Unlock()
+	loggerGlobal.infoWriter = infoF
+	loggerGlobal.warnWriter = warnF
+	loggerGlobal.errWriter = errF
+	loggerGlobal.ctxKeys = CtxKeys
 }
