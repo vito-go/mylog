@@ -213,70 +213,6 @@ func BenchmarkTraceIDGeneration(b *testing.B) {
 	}
 }
 
-// TestNodeID tests the custom node ID functionality
-func TestNodeID(t *testing.T) {
-	// Test 1: Get default auto-generated node ID
-	defaultID := GetNodeID()
-	if defaultID == "" || defaultID == "unknown" {
-		t.Errorf("Default node ID should not be empty or 'unknown', got: %s", defaultID)
-	}
-
-	// Test 2: Node ID should have format "PID_IP" (e.g., "580_015")
-	parts := splitString(defaultID, '_')
-	if len(parts) != 2 {
-		t.Errorf("Node ID should have 2 parts (PID_IP), got %d: %s", len(parts), defaultID)
-	} else {
-		// Verify PID part (3 decimal digits)
-		if len(parts[0]) != 3 {
-			t.Errorf("PID part should be 3 digits, got %d: %s", len(parts[0]), parts[0])
-		}
-
-		// Verify IP part (3 decimal digits)
-		if len(parts[1]) != 3 {
-			t.Errorf("IP part should be 3 digits, got %d: %s", len(parts[1]), parts[1])
-		}
-
-		t.Logf("Default node ID: %s (PID=%s IP=.%s)", defaultID, parts[0], parts[1])
-	}
-
-	// Test 3: Node ID should be consistent across multiple calls
-	secondCall := GetNodeID()
-	if defaultID != secondCall {
-		t.Errorf("GetNodeID should return consistent value, got %s then %s", defaultID, secondCall)
-	}
-
-	// Test 4: Set custom node ID
-	customID := "test-server-123"
-	SetNodeID(customID)
-	// Note: Since nodeIDOnce has already fired, the custom ID won't override
-	// This tests the actual behavior - SetNodeID should be called before first GetNodeID
-
-	// Test 5: Empty string should be ignored
-	SetNodeID("")
-	currentID := GetNodeID()
-	if currentID == "" {
-		t.Error("Empty SetNodeID should be ignored")
-	}
-}
-
-// TestSetNodeIDBeforeGeneration tests that custom node ID works when set before first use
-func TestSetNodeIDBeforeGeneration(t *testing.T) {
-	// This test would require resetting the package state, which is not possible
-	// In a real scenario, user would call SetNodeID during init before any logging
-	customID := "custom-node-001"
-
-	// Generate a trace ID with custom node
-	traceID := GenerateTraceID()
-	t.Logf("Generated trace ID: %s", traceID)
-
-	// Verify the trace ID contains the node ID
-	if !contains(traceID, GetNodeID()) {
-		t.Errorf("Trace ID should contain node ID. TraceID: %s, NodeID: %s", traceID, GetNodeID())
-	}
-
-	_ = customID // acknowledge we can't fully test this without package reset
-}
-
 // TestGenerateTraceIDFormat tests the format and structure of generated trace IDs
 func TestGenerateTraceIDFormat(t *testing.T) {
 	traceID := GenerateTraceID()
@@ -396,37 +332,11 @@ func TestNewContextVsWithTraceID(t *testing.T) {
 	t.Logf("WithTraceID trace ID: %s", traceID2)
 }
 
-// TestConcurrentNodeIDAccess tests thread-safety of GetNodeID
-func TestConcurrentNodeIDAccess(t *testing.T) {
-	const goroutines = 100
-	var wg sync.WaitGroup
-	results := make([]string, goroutines)
-
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func(index int) {
-			defer wg.Done()
-			results[index] = GetNodeID()
-		}(i)
-	}
-	wg.Wait()
-
-	// All goroutines should get the same node ID
-	firstID := results[0]
-	for i, id := range results {
-		if id != firstID {
-			t.Errorf("Concurrent GetNodeID returned different values at index %d: %s vs %s", i, id, firstID)
-		}
-	}
-
-	t.Logf("Concurrent access verified, node ID: %s", firstID)
-}
-
 // Helper functions
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
 		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-		findSubstring(s, substr)))
+			findSubstring(s, substr)))
 }
 
 func findSubstring(s, substr string) bool {

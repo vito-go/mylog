@@ -3,7 +3,6 @@ package mylog
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,124 +90,9 @@ func init() {
 	}
 }
 
-var (
-	nodeID       atomic.Value // stores string - the unique node identifier (format: "PID_IP")
-	nodeIDOnce   sync.Once
-	epochStartUs = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() // Relative timestamp base (microseconds)
-)
-
-// SetNodeID allows users to set a custom node ID for trace generation.
-// This should be called before any logging occurs, typically during application initialization.
-// If not set, a default node ID will be auto-generated on first use.
-//
-// Example:
-//
-//	mylog.SetNodeID("server-01")
-//	mylog.SetNodeID("pod-abc123")
-func SetNodeID(id string) {
-	if id == "" {
-		return
-	}
-	nodeID.Store(id)
-}
-
-// GetNodeID returns the current node ID. If no custom ID was set,
-// it will be auto-generated on first call using hostname, IP, and PID.
-// This function is thread-safe and idempotent.
-func GetNodeID() string {
-	nodeIDOnce.Do(initNodeID)
-	if v := nodeID.Load(); v != nil {
-		return v.(string)
-	}
-	return "unknown"
-}
-
-// initNodeID generates simplified node metadata with PID and IP.
-// Format: "{PID_3digits}_{IP_3digits}"
-// Example: "580_015" means PID=580, IP=.15
-func initNodeID() {
-	// If user already set a custom ID, don't override
-	if v := nodeID.Load(); v != nil {
-		return
-	}
-
-	var pid uint16
-	var ipLast uint8
-
-	// 1. Get PID mod 1000
-	pid = uint16(os.Getpid() % 1000)
-
-	// 2. Get IP last segment
-	if priIP, err := getPrivateIP(); err == nil {
-		segments := strings.Split(priIP, ".")
-		if len(segments) == 4 {
-			var lastSeg int
-			fmt.Sscanf(segments[3], "%d", &lastSeg)
-			ipLast = uint8(lastSeg)
-		}
-	}
-
-	// Format: {PID_3digits}_{IP_3digits}
-	// Example: "580_015"
-	nodeID.Store(fmt.Sprintf("%03d_%03d", pid, ipLast))
-}
-
 // GenerateTraceID generates a compact trace ID with microsecond precision.
-// Format: {Microsecond_13hex}_{Random_6hex}_{PID_3dec}_{IP_3dec}
-// Result looks like: 0ad6c98a8845c_a1b2cd_580_015
-// Total length: ~30 characters
-//
-// Components (all directly visible):
-// - Timestamp: relative microseconds since 2020-01-01 (13 hex chars, ~142 years range)
-// - Random: 3 bytes crypto/rand for uniqueness (6 hex chars = 16.7M combinations)
-// - PID: process ID mod 1000 in decimal (3 digits, e.g., 580)
-// - IP: last segment of IP address in decimal (3 digits, e.g., 015 = .15)
-//
-// Uniqueness guarantees:
-// - Time dimension: microsecond precision (no same-microsecond collision in practice)
-// - Extra entropy: 3 bytes random (16.7M combinations) ensures uniqueness
-// - Process isolation: PID visible
-// - Network isolation: IP visible
-//
-// Note: Microsecond provides excellent precision (1μs = 1000ns) while maintaining
-// a compact format. With 3-byte random, even concurrent calls within the same
-// microsecond will have different IDs.
 func GenerateTraceID() string {
-	// Relative timestamp (microseconds since epochStartUs)
-	now := uint64(time.Now().UnixMicro() - epochStartUs)
-
-	// Get 3 random bytes from pool (use first 3 bytes)
-	bPtr := randBytesPool.Get().(*[]byte)
-	b := *bPtr
-	_, _ = rand.Read(b)
-
-	// Get node metadata (format: "PID_IP")
-	nodeIDStr := GetNodeID()
-
-	// Use strings.Builder for efficient string construction
-	var sb strings.Builder
-	// Pre-allocate: timestamp(13) + _ + random(6) + _ + PID_IP(7) = ~28
-	sb.Grow(30)
-
-	// Write timestamp (13 hex chars for microseconds)
-	sb.WriteString(fmt.Sprintf("%013x", now))
-	sb.WriteByte('_')
-
-	// Write random (6 hex chars = 3 bytes)
-	const hexChars = "0123456789abcdef"
-	for i := 0; i < 3; i++ {
-		sb.WriteByte(hexChars[b[i]>>4])
-		sb.WriteByte(hexChars[b[i]&0x0f])
-	}
-	sb.WriteByte('_')
-
-	// Write node ID (PID_IP format, e.g., "580_015")
-	sb.WriteString(nodeIDStr)
-
-	// Return bytes to pool
-	randBytesPool.Put(bPtr)
-
-	return sb.String()
+	return genUUID().String()
 }
 
 func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, options ...OptionApplier) {
