@@ -1,13 +1,11 @@
 package mylog
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,14 +14,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// Log Levels
+// --- 类型与常量 ---
+
 const (
 	LevelInfo  Level = "INFO"
-	LevelError Level = "ERROR"
 	LevelWarn  Level = "WARN"
+	LevelError Level = "ERROR"
 )
 
 type Level string
@@ -36,38 +36,7 @@ func (n Name) Prefix() string {
 	return "[" + string(n) + "] "
 }
 
-// Global variables
-var (
-	debugVerbose  bool
-	defaultLogger *Logger
-	initOnce      atomic.Bool
-	// TraceIdKey is the key used to store trace ID in context.
-	TraceIdKey = &contextKey{"traceId"}
-
-	// Pre-allocated pools to reduce GC pressure
-	outBufPool    = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, 512)) }}
-	bufferPool    = sync.Pool{New: func() any { return new([]byte) }}
-	randBytesPool = sync.Pool{New: func() any { b := make([]byte, 4); return &b }}
-)
-
 type contextKey struct{ name string }
-
-// Logger structure for production-grade logging
-type Logger struct {
-	defaultInfoLogger  *logger
-	defaultWarnLogger  *logger
-	defaultErrorLogger *logger
-	logMap             sync.Map // Use sync.Map for thread-safe access to named loggers
-	hook               func(ctx context.Context, hookRecord *HookRecord)
-	hideFileLine       atomic.Bool
-	hideFunction       atomic.Bool
-	mu                 sync.RWMutex
-}
-
-type logger struct {
-	io.Writer
-	//prefix string
-}
 
 type HookRecord struct {
 	File     string
@@ -79,99 +48,135 @@ type HookRecord struct {
 	TraceId  string
 }
 
-// --- Initialization ---
+// --- 初始化参数结构 ---
 
-func init() {
-	// Default instance writing to Stdout/Stderr
-	defaultLogger = &Logger{
-		defaultInfoLogger:  &logger{Writer: os.Stdout},
-		defaultErrorLogger: &logger{Writer: os.Stderr},
-		defaultWarnLogger:  &logger{Writer: os.Stderr},
-	}
-}
-
-// GenerateTraceID generates a compact trace ID with microsecond precision.
-func GenerateTraceID() string {
-	return genUUID().String()
-}
-
-func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, options ...OptionApplier) {
-	if initOnce.Swap(true) {
-		return
-	}
-	debugVerbose = verbose
-
-	infW := &logger{Writer: infoLogger}
-	// Combined writers for Warn and Error (standard practice: log errors to both info and error files)
-	errW := &logger{Writer: io.MultiWriter(errLogger, infoLogger)}
-
-	defaultLogger.defaultInfoLogger = infW
-	defaultLogger.defaultWarnLogger = errW
-	defaultLogger.defaultErrorLogger = errW
-
-	for _, option := range options {
-		option.Apply(defaultLogger)
-	}
-}
-
-// SetHook sets a custom hook function for the default logger.
-// This is thread-safe and can be called at any time, though typically during init.
-func SetHook(h func(ctx context.Context, hookRecord *HookRecord)) {
-	defaultLogger.mu.RLock()
-	defer defaultLogger.mu.RUnlock()
-	defaultLogger.hook = h
-}
-
-type FileLinOption struct {
+type Option struct {
+	HideFunction bool
 	HideFileLine bool
 }
 
-func (f FileLinOption) Apply(defaultLogger *Logger) {
-	defaultLogger.hideFileLine.Store(f.HideFileLine)
+type NameLogger struct {
+	LogName Name
+	Logger  *lumberjack.Logger
 }
 
-type FunctionOption struct {
-	HideFunction bool
+// --- 核心结构体 ---
+
+type logger struct {
+	io.Writer
 }
 
-func (f FunctionOption) Apply(defaultLogger *Logger) {
-	defaultLogger.hideFunction.Store(f.HideFunction)
+type loggerWithLevel struct {
+	infoLogger, warnLogger, errorLogger *logger
 }
 
-// --- Global helper functions for quick logging (like standard log package) ---
-
-func Info(args ...any) {
-	defaultLogger.defaultInfoLogger.log(LevelInfo, fmt.Sprint(args...))
+type Logger struct {
+	defaultInfoLogger  *logger
+	defaultWarnLogger  *logger
+	defaultErrorLogger *logger
+	logMap             sync.Map
+	hook               func(ctx context.Context, hookRecord *HookRecord)
+	hideFileLine       atomic.Bool
+	hideFunction       atomic.Bool
+	mu                 sync.RWMutex
+	closers            atomic.Pointer[[]io.Closer]
 }
 
-func Infof(format string, args ...any) {
-	defaultLogger.defaultInfoLogger.log(LevelInfo, fmt.Sprintf(format, args...))
+var (
+	debugVerbose  atomic.Bool
+	defaultLogger *Logger
+	initOnce      atomic.Bool
+	TraceIdKey    = &contextKey{"traceId"}
+
+	bufferPool = sync.Pool{New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	}}
+)
+
+// --- 初始化 ---
+
+func init() {
+	debugVerbose.Store(true)
+	defaultLogger = &Logger{
+		defaultInfoLogger:  &logger{Writer: os.Stdout},
+		defaultWarnLogger:  &logger{Writer: os.Stderr},
+		defaultErrorLogger: &logger{Writer: os.Stderr},
+	}
 }
 
-func Error(args ...any) {
-	defaultLogger.defaultErrorLogger.log(LevelError, fmt.Sprint(args...))
+func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, option Option, nameLoggers ...NameLogger) {
+	if initOnce.Swap(true) {
+		return
+	}
+	debugVerbose.Store(verbose)
+
+	// 设置全局配置开关
+	defaultLogger.hideFileLine.Store(option.HideFileLine)
+	defaultLogger.hideFunction.Store(option.HideFunction)
+
+	var closer []io.Closer
+
+	// 1. 设置默认输出
+	if infoLogger != nil {
+		closer = append(closer, infoLogger)
+		defaultLogger.defaultInfoLogger = &logger{Writer: infoLogger}
+	}
+
+	// 错误日志合并写入 (MultiWriter)
+	var errW io.Writer = os.Stderr
+	if errLogger != nil {
+		closer = append(closer, errLogger)
+		errW = io.MultiWriter(errLogger, defaultLogger.defaultInfoLogger.Writer)
+	}
+	defaultLogger.defaultWarnLogger = &logger{Writer: errW}
+	defaultLogger.defaultErrorLogger = &logger{Writer: errW}
+
+	// 2. 设置命名业务日志
+	for _, nl := range nameLoggers {
+		if nl.Logger == nil || nl.LogName == "" {
+			continue
+		}
+		closer = append(closer, nl.Logger)
+		nLogger := &loggerWithLevel{
+			infoLogger:  &logger{Writer: io.MultiWriter(nl.Logger, defaultLogger.defaultInfoLogger.Writer)},
+			warnLogger:  &logger{Writer: io.MultiWriter(nl.Logger, defaultLogger.defaultWarnLogger.Writer)},
+			errorLogger: &logger{Writer: io.MultiWriter(nl.Logger, defaultLogger.defaultErrorLogger.Writer)},
+		}
+		defaultLogger.logMap.Store(nl.LogName, nLogger)
+	}
+
+	// 3. 原子存储所有 Closer
+	defaultLogger.closers.Store(&closer)
 }
 
-func Errorf(format string, args ...any) {
-	defaultLogger.defaultErrorLogger.log(LevelError, fmt.Sprintf(format, args...))
+func Close() error {
+	if !initOnce.Swap(false) {
+		return nil
+	}
+	ptr := defaultLogger.closers.Load()
+	if ptr == nil {
+		return nil
+	}
+	for _, c := range *ptr {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+	defaultLogger.closers.Store(nil)
+	return nil
 }
 
-// Internal method for the logger struct to support global functions
-func (l *logger) log(level Level, msg string) {
-	outPut(context.Background(), "", l.Writer, level, msg)
+// --- 上下文与 TraceID ---
+
+func GenerateTraceID() string {
+	return UUID().String()
 }
 
-// --- Professional ID Generation (Replacing RandomId) ---
-
-// NewContext returns a new context with a professional trace ID.
-// It creates a context derived from context.Background().
 func NewContext() context.Context {
 	return context.WithValue(context.Background(), TraceIdKey, GenerateTraceID())
 }
 
-// WithTraceID returns a new context derived from parent with a new trace ID.
-// If parent is nil, it uses context.Background().
-// This is the recommended way to create a traced context from an existing context.
 func WithTraceID(parent context.Context) context.Context {
 	if parent == nil {
 		parent = context.Background()
@@ -179,7 +184,26 @@ func WithTraceID(parent context.Context) context.Context {
 	return context.WithValue(parent, TraceIdKey, GenerateTraceID())
 }
 
-// --- FieldLogger Logic ---
+// --- 全局快捷方法 ---
+
+func Info(args ...any) { defaultLogger.defaultInfoLogger.log(LevelInfo, fmt.Sprint(args...)) }
+func Infof(f string, args ...any) {
+	defaultLogger.defaultInfoLogger.log(LevelInfo, fmt.Sprintf(f, args...))
+}
+func Warn(args ...any) { defaultLogger.defaultWarnLogger.log(LevelWarn, fmt.Sprint(args...)) }
+func Warnf(f string, args ...any) {
+	defaultLogger.defaultWarnLogger.log(LevelWarn, fmt.Sprintf(f, args...))
+}
+func Error(args ...any) { defaultLogger.defaultErrorLogger.log(LevelError, fmt.Sprint(args...)) }
+func Errorf(f string, args ...any) {
+	defaultLogger.defaultErrorLogger.log(LevelError, fmt.Sprintf(f, args...))
+}
+
+func (l *logger) log(level Level, msg string) {
+	outPut(context.Background(), "", l.Writer, level, msg)
+}
+
+// --- FieldLogger (业务逻辑调用) ---
 
 type FieldLogger struct {
 	ctx     context.Context
@@ -187,10 +211,7 @@ type FieldLogger struct {
 	kvs     []kv
 }
 
-type kv struct {
-	key   string
-	value string
-}
+type kv struct{ key, value string }
 
 func Ctx(ctx context.Context) *FieldLogger {
 	if ctx == nil {
@@ -209,68 +230,19 @@ func (w *FieldLogger) WithField(key string, value any) *FieldLogger {
 	return w
 }
 
-func (w *FieldLogger) WithFields(k1 string, v1 interface{}, k2 string, v2 interface{}, kvs ...interface{}) *FieldLogger {
-	w.kvs = append(w.kvs, kv{key: k1, value: stringify(v1)}, kv{key: k2, value: stringify(v2)})
-	if len(kvs)%2 != 0 {
-		// !BADKEY
-		w.kvs = append(w.kvs, kv{key: "!BADKEY", value: fmt.Sprintf("%+v", kvs)})
-		return w
-	}
-	for i := 0; i < len(kvs); i += 2 {
-		key, ok := kvs[i].(string)
-		if !ok {
-			key = "!BADKEY"
-		}
-		w.kvs = append(w.kvs, kv{key: key, value: stringify(kvs[i+1])})
-	}
-	return w
-}
+func (w *FieldLogger) Info(args ...any)             { w.log(LevelInfo, fmt.Sprint(args...)) }
+func (w *FieldLogger) Infof(f string, args ...any)  { w.log(LevelInfo, fmt.Sprintf(f, args...)) }
+func (w *FieldLogger) Warn(args ...any)             { w.log(LevelWarn, fmt.Sprint(args...)) }
+func (w *FieldLogger) Warnf(f string, args ...any)  { w.log(LevelWarn, fmt.Sprintf(f, args...)) }
+func (w *FieldLogger) Error(args ...any)            { w.log(LevelError, fmt.Sprint(args...)) }
+func (w *FieldLogger) Errorf(f string, args ...any) { w.log(LevelError, fmt.Sprintf(f, args...)) }
 
-// Info level logging
-func (w *FieldLogger) Info(args ...any) {
-	w.log(LevelInfo, fmt.Sprint(args...))
-}
-
-func Println(args ...any) {
-	Ctx(context.Background()).log(LevelInfo, fmt.Sprint(args...))
-}
-
-func (w *FieldLogger) Infof(format string, args ...any) {
-	w.log(LevelInfo, fmt.Sprintf(format, args...))
-}
-func Printf(format string, args ...any) {
-	Ctx(context.Background()).log(LevelInfo, fmt.Sprintf(format, args...))
-}
-
-// Error level logging
-func (w *FieldLogger) Error(args ...any) {
-	w.log(LevelError, fmt.Sprint(args...))
-}
-
-func (w *FieldLogger) Errorf(format string, args ...any) {
-	w.log(LevelError, fmt.Sprintf(format, args...))
-}
-
-// Warn level logging
-func (w *FieldLogger) Warn(args ...any) {
-	w.log(LevelWarn, fmt.Sprint(args...))
-}
-
-func (w *FieldLogger) Warnf(format string, args ...any) {
-	w.log(LevelWarn, fmt.Sprintf(format, args...))
-}
-
-// Internal routing logic
 func (w *FieldLogger) log(level Level, msg string) {
 	l := w.getTargetLogger(level)
-
-	// Add JSON fields to message if present
 	if len(w.kvs) > 0 {
 		msg += w.kvToJson()
 	}
-	prefix := w.logName.Prefix()
-
-	outPut(w.ctx, prefix, l.Writer, level, msg)
+	outPut(w.ctx, w.logName.Prefix(), l.Writer, level, msg)
 }
 
 func (w *FieldLogger) getTargetLogger(level Level) *logger {
@@ -297,10 +269,9 @@ func (w *FieldLogger) getTargetLogger(level Level) *logger {
 	}
 }
 
-// --- Core Output Engine ---
+// --- 核心输出引擎 ---
 
 func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, content string) {
-	// 1. Caller Info (Optimized)
 	var file, function string
 	var line int
 	pc, fFile, fLine, ok := runtime.Caller(3)
@@ -316,21 +287,16 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 		}
 	}
 
-	// 2. Buffer Management
 	bufPtr := getBuffer()
 	defer putBuffer(bufPtr)
 	buf := *bufPtr
 
-	// 3. TraceID extraction
 	traceID, _ := ctx.Value(TraceIdKey).(string)
 	if traceID == "" {
 		traceID = "-"
 	}
 
-	// 4. Efficient Formatting
-	// Use explicit byte appends or small fprints for performance
 	timestamp := time.Now().Format("2006-01-02T15:04:05.000")
-
 	lineInfo := ""
 	if !defaultLogger.hideFileLine.Load() {
 		lineInfo = fmt.Sprintf(" %s:%d", file, line)
@@ -345,10 +311,8 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 		buf = append(buf, '\n')
 	}
 
-	// 5. I/O operations
 	_, _ = writer.Write(buf)
-
-	if debugVerbose {
+	if debugVerbose.Load() {
 		if level == LevelError || level == LevelWarn {
 			_, _ = os.Stderr.Write(buf)
 		} else {
@@ -356,7 +320,6 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 		}
 	}
 
-	// 6. Hook execution
 	if hook := defaultLogger.hook; hook != nil {
 		hook(ctx, &HookRecord{
 			File: file, Line: line, Function: function,
@@ -365,7 +328,31 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 	}
 }
 
-// --- Utilities ---
+// --- 工具函数与 UUID ---
+
+func UUID() uuid.UUID { return genUUID() }
+
+func genUUID() uuid.UUID {
+	if v7UUID, err := uuid.NewV7(); err == nil {
+		return v7UUID
+	}
+	return generateFallbackUUIDv7()
+}
+
+func generateFallbackUUIDv7() uuid.UUID {
+	nowMs := uint64(time.Now().UnixMilli())
+	var u uuid.UUID
+	u[0] = byte(nowMs >> 40)
+	u[1] = byte(nowMs >> 32)
+	u[2] = byte(nowMs >> 24)
+	u[3] = byte(nowMs >> 16)
+	u[4] = byte(nowMs >> 8)
+	u[5] = byte(nowMs)
+	rand.Read(u[6:])
+	u[6] = (u[6] & 0x0f) | 0x70
+	u[8] = (u[8] & 0x3f) | 0x80
+	return u
+}
 
 func stringify(v any) string {
 	switch val := v.(type) {
@@ -399,43 +386,6 @@ func (w *FieldLogger) kvToJson() string {
 	return sb.String()
 }
 
-func getPrivateIP() (string, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", err
-	}
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.IP.String(), nil
-		}
-	}
-	return "", errors.New("no private ip found")
-}
-
-// --- Options & Configuration ---
-
-type OptionApplier interface {
-	Apply(dl *Logger)
-}
-
-type loggerWithLevel struct {
-	infoLogger, warnLogger, errorLogger *logger
-}
-
-type LoggerOption struct {
-	LogName Name
-	Logger  *lumberjack.Logger
-}
-
-func (o LoggerOption) Apply(dl *Logger) {
-	newLogger := &loggerWithLevel{
-		infoLogger:  &logger{Writer: io.MultiWriter(o.Logger, dl.defaultInfoLogger)},
-		warnLogger:  &logger{Writer: io.MultiWriter(o.Logger, dl.defaultWarnLogger)},
-		errorLogger: &logger{Writer: io.MultiWriter(o.Logger, dl.defaultErrorLogger)},
-	}
-	dl.logMap.Store(o.LogName, newLogger)
-}
-
 func getBuffer() *[]byte {
 	p := bufferPool.Get().(*[]byte)
 	*p = (*p)[:0]
@@ -443,8 +393,7 @@ func getBuffer() *[]byte {
 }
 
 func putBuffer(p *[]byte) {
-	if cap(*p) > 64<<10 {
-		*p = nil
+	if cap(*p) < 64<<10 {
+		bufferPool.Put(p)
 	}
-	bufferPool.Put(p)
 }
