@@ -18,7 +18,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// --- 类型与常量 ---
+// --- 类型与常量定义 ---
 
 const (
 	LevelInfo  Level = "INFO"
@@ -48,7 +48,7 @@ type HookRecord struct {
 	TraceId  string
 }
 
-// --- 初始化参数结构 ---
+// --- 初始化结构体 ---
 
 type Option struct {
 	HideFunction bool
@@ -94,7 +94,7 @@ var (
 	}}
 )
 
-// --- 初始化 ---
+// --- 初始化与生命周期 ---
 
 func init() {
 	debugVerbose.Store(true)
@@ -105,13 +105,11 @@ func init() {
 	}
 }
 
-func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, option Option, nameLoggers ...NameLogger) {
+func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, option Option, nameLoggers ...*NameLogger) {
 	if initOnce.Swap(true) {
 		return
 	}
 	debugVerbose.Store(verbose)
-
-	// 设置全局配置开关
 	defaultLogger.hideFileLine.Store(option.HideFileLine)
 	defaultLogger.hideFunction.Store(option.HideFunction)
 
@@ -123,7 +121,6 @@ func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberja
 		defaultLogger.defaultInfoLogger = &logger{Writer: infoLogger}
 	}
 
-	// 错误日志合并写入 (MultiWriter)
 	var errW io.Writer = os.Stderr
 	if errLogger != nil {
 		closer = append(closer, errLogger)
@@ -145,8 +142,6 @@ func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberja
 		}
 		defaultLogger.logMap.Store(nl.LogName, nLogger)
 	}
-
-	// 3. 原子存储所有 Closer
 	defaultLogger.closers.Store(&closer)
 }
 
@@ -154,24 +149,28 @@ func Close() error {
 	if !initOnce.Swap(false) {
 		return nil
 	}
-	ptr := defaultLogger.closers.Load()
-	if ptr == nil {
-		return nil
-	}
-	for _, c := range *ptr {
-		if c != nil {
-			_ = c.Close()
+	if ptr := defaultLogger.closers.Load(); ptr != nil {
+		for _, c := range *ptr {
+			if c != nil {
+				_ = c.Close()
+			}
 		}
 	}
 	defaultLogger.closers.Store(nil)
 	return nil
 }
 
-// --- 上下文与 TraceID ---
+// --- Hook 接口 ---
 
-func GenerateTraceID() string {
-	return UUID().String()
+func SetHook(h func(ctx context.Context, hookRecord *HookRecord)) {
+	defaultLogger.mu.Lock()
+	defer defaultLogger.mu.Unlock()
+	defaultLogger.hook = h
 }
+
+// --- 上下文与 Trace ---
+
+func GenerateTraceID() string { return UUID().String() }
 
 func NewContext() context.Context {
 	return context.WithValue(context.Background(), TraceIdKey, GenerateTraceID())
@@ -184,7 +183,7 @@ func WithTraceID(parent context.Context) context.Context {
 	return context.WithValue(parent, TraceIdKey, GenerateTraceID())
 }
 
-// --- 全局快捷方法 ---
+// --- 全局输出方法 ---
 
 func Info(args ...any) { defaultLogger.defaultInfoLogger.log(LevelInfo, fmt.Sprint(args...)) }
 func Infof(f string, args ...any) {
@@ -203,7 +202,7 @@ func (l *logger) log(level Level, msg string) {
 	outPut(context.Background(), "", l.Writer, level, msg)
 }
 
-// --- FieldLogger (业务逻辑调用) ---
+// --- FieldLogger 业务链路调用 ---
 
 type FieldLogger struct {
 	ctx     context.Context
@@ -269,7 +268,7 @@ func (w *FieldLogger) getTargetLogger(level Level) *logger {
 	}
 }
 
-// --- 核心输出引擎 ---
+// --- 核心输出引擎 (outPut) ---
 
 func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, content string) {
 	var file, function string
@@ -296,14 +295,8 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 		traceID = "-"
 	}
 
-	timestamp := time.Now().Format("2006-01-02T15:04:05.000")
-	lineInfo := ""
-	if !defaultLogger.hideFileLine.Load() {
-		lineInfo = fmt.Sprintf(" %s:%d", file, line)
-	}
-
-	header := fmt.Sprintf("%s[%s] %s%s %s traceId:%s ",
-		prefix, level, timestamp, lineInfo, function, traceID)
+	header := fmt.Sprintf("%s[%s] %s %s:%d %s traceId:%s ",
+		prefix, level, time.Now().Format("2006-01-02T15:04:05.000"), file, line, function, traceID)
 
 	buf = append(buf, header...)
 	buf = append(buf, content...)
@@ -320,7 +313,10 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 		}
 	}
 
-	if hook := defaultLogger.hook; hook != nil {
+	defaultLogger.mu.RLock()
+	hook := defaultLogger.hook
+	defaultLogger.mu.RUnlock()
+	if hook != nil {
 		hook(ctx, &HookRecord{
 			File: file, Line: line, Function: function,
 			Level: level, Content: content, TraceId: traceID,
@@ -328,18 +324,14 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 	}
 }
 
-// --- 工具函数与 UUID ---
+// --- UUID 与 工具函数 ---
 
-func UUID() uuid.UUID { return genUUID() }
-
-func genUUID() uuid.UUID {
-	if v7UUID, err := uuid.NewV7(); err == nil {
-		return v7UUID
+func UUID() uuid.UUID {
+	v7, err := uuid.NewV7()
+	if err == nil {
+		return v7
 	}
-	return generateFallbackUUIDv7()
-}
-
-func generateFallbackUUIDv7() uuid.UUID {
+	// Fallback
 	nowMs := uint64(time.Now().UnixMilli())
 	var u uuid.UUID
 	u[0] = byte(nowMs >> 40)
