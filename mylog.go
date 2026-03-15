@@ -83,10 +83,10 @@ type Logger struct {
 }
 
 var (
-	debugVerbose  atomic.Bool
-	defaultLogger *Logger
-	initOnce      atomic.Bool
-	TraceIdKey    = &contextKey{"traceId"}
+	mirrorToConsole atomic.Bool
+	defaultLogger   *Logger
+	initOnce        atomic.Bool
+	TraceIdKey      = &contextKey{"traceId"}
 
 	bufferPool = sync.Pool{New: func() any {
 		b := make([]byte, 0, 512)
@@ -97,7 +97,6 @@ var (
 // --- 初始化与生命周期 ---
 
 func init() {
-	debugVerbose.Store(true)
 	defaultLogger = &Logger{
 		defaultInfoLogger:  &logger{Writer: os.Stdout},
 		defaultWarnLogger:  &logger{Writer: os.Stderr},
@@ -105,11 +104,11 @@ func init() {
 	}
 }
 
-func InitLogger(verbose bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, option Option, nameLoggers ...*NameLogger) {
+func InitLogger(mirror bool, infoLogger *lumberjack.Logger, errLogger *lumberjack.Logger, option Option, nameLoggers ...*NameLogger) {
 	if initOnce.Swap(true) {
 		return
 	}
-	debugVerbose.Store(verbose)
+	mirrorToConsole.Store(mirror)
 	defaultLogger.hideFileLine.Store(option.HideFileLine)
 	defaultLogger.hideFunction.Store(option.HideFunction)
 
@@ -305,7 +304,7 @@ func outPut(ctx context.Context, prefix string, writer io.Writer, level Level, c
 	}
 
 	_, _ = writer.Write(buf)
-	if debugVerbose.Load() {
+	if mirrorToConsole.Load() {
 		if level == LevelError || level == LevelWarn {
 			_, _ = os.Stderr.Write(buf)
 		} else {
